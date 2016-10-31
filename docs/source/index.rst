@@ -12,10 +12,14 @@ Welcome to the Cozmo SDK Beta!
 ==============================
 
 .. toctree::
-    :maxdepth: 2
+    :maxdepth: 1
     :caption: Installation
 
-    install
+    initial
+    install-macos.rst
+    install-windows.rst
+    install-linux.rst
+    adb.rst
     vagrant.rst
 
 .. toctree::
