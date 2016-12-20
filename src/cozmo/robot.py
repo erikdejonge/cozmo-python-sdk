@@ -255,10 +255,10 @@ class SayText(action.Action):
             self.play_event = _clad_to_engine_cozmo.AnimationTrigger.Count
 
         if use_cozmo_voice:
-            self.say_style = _clad_to_engine_cozmo.SayTextVoiceStyle.CozmoProcessing
+            self.say_style = _clad_to_engine_cozmo.SayTextVoiceStyle.CozmoProcessing_Sentence
         else:
             # default male human voice
-            self.say_style = _clad_to_engine_cozmo.SayTextVoiceStyle.UnProcessed
+            self.say_style = _clad_to_engine_cozmo.SayTextVoiceStyle.Unprocessed
 
         self.duration_scalar = duration_scalar
         self.voice_pitch = voice_pitch
@@ -272,7 +272,8 @@ class SayText(action.Action):
                                              playEvent=self.play_event,
                                              voiceStyle=self.say_style,
                                              durationScalar=self.duration_scalar,
-                                             voicePitch=self.voice_pitch)
+                                             voicePitch=self.voice_pitch,
+                                             fitToDuration=False)
 
 
 class SetHeadAngle(action.Action):
@@ -389,7 +390,27 @@ class TurnTowardsFace(action.Action):
 
     def _encode(self):
         return _clad_to_engine_iface.TurnTowardsFace(
-            faceID=self.face.face_id)
+            faceID=self.face.face_id,
+            maxTurnAngle_rad=util.degrees(180).radians)
+
+
+
+class PerformOffChargerContext(event.Dispatcher):
+    '''A helper class to provide a context manager to do operations while Cozmo is off charger.'''
+    def __init__(self, robot, **kw):
+        super().__init__(**kw)
+        self.robot = robot
+
+    async def __aenter__(self):
+        self.was_on_charger = self.robot.is_on_charger
+        if self.was_on_charger:
+            await self.robot.drive_off_charger_contacts().wait_for_completed()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        if self.was_on_charger:
+            await self.robot.backup_onto_charger()
+        return False
 
 
 class Robot(event.Dispatcher):
@@ -481,6 +502,8 @@ class Robot(event.Dispatcher):
     #: :class:`cozmo.camera.Camera` class or subclass instance.
     camera_factory = camera.Camera
 
+    perform_off_charger_factory = PerformOffChargerContext
+
     #: callable: The factory function that returns a
     #: :class:`cozmo.world.World` class or subclass instance.
     world_factory = world.World
@@ -490,6 +513,9 @@ class Robot(event.Dispatcher):
     #: bool: Set to True if the robot should drive off the charger as soon
     # as the SDK connects to the engine.  Defaults to True.
     drive_off_charger_on_connect = True  # Required for most movement actions
+
+    _is_behavior_running = False
+    _is_freeplay_mode_active = False
 
     def __init__(self, conn, robot_id, is_primary, **kw):
         super().__init__(**kw)
@@ -520,6 +546,19 @@ class Robot(event.Dispatcher):
         self.lift_height = None
         #: float: The current battery voltage (not linear, but < 3.5 is low)
         self.battery_voltage = None
+
+        #: :class:`cozmo.util.Vector3`: The current accelerometer reading (x,y,z)
+        #: In mm/s^2, measured in Cozmo's head (e.g. x=0 when Cozmo's head is level
+        #: but x = z = ~7000 mm/s^2 when Cozmo's head is angled 45 degrees up)
+        self.accelerometer = None
+
+        #: :class:`cozmo.util.Vector3`: The current gyro reading (x,y,z)
+        #: In radians/s, measured in Cozmo's head.
+        #: Therefore a large value in a given component would indicate Cozmo is
+        #: being rotated around that axis (where x=forward, y=left, z=up), e.g.
+        #: y = -5 would indicate that Cozmo is being rolled onto his back
+        self.gyro = None
+
         #: int: The ID of the object currently being carried (-1 if none)
         self.carrying_object_id = -1
         #: int: The ID of the object on top of the object currently being carried (-1 if none)
@@ -553,15 +592,12 @@ class Robot(event.Dispatcher):
             # Note: Robot state is reset on entering SDK mode, and after any SDK program exits
             self.stop_all_motors()
             self.enable_reactionary_behaviors(False)
+            self._stop_behavior()
 
             # Ensure the SDK has full control of cube lights
             self._set_cube_light_state(False)
 
             await self.world.delete_all_custom_objects()
-            self._reset_behavior_state()
-
-            msg = _clad_to_engine_iface.RequestAvailableObjects()
-            self.conn.send_msg(msg)
 
             # wait for animations to load
             await self.conn.anim_names.wait_for_loaded()
@@ -574,10 +610,12 @@ class Robot(event.Dispatcher):
             self.dispatch_event(EvtRobotReady, robot=self)
         asyncio.ensure_future(_init(), loop=self._loop)
 
-    def _reset_behavior_state(self):
-        msg = _clad_to_engine_iface.ExecuteBehavior(
-                behaviorType=_clad_to_engine_cozmo.BehaviorType.NoneBehavior)
+    def _stop_behavior(self):
+        # Internal helper method called from Behavior.stop etc.
+        msg = _clad_to_engine_iface.ExecuteBehaviorByExecutableType(
+                behaviorType=_clad_to_engine_cozmo.ExecutableBehaviorType.NoneBehavior)
         self.conn.send_msg(msg)
+        self._is_behavior_running = False
 
     def _set_cube_light_state(self, enable):
         msg = _clad_to_engine_iface.EnableLightStates(enable=enable, objectID=-1)
@@ -603,7 +641,7 @@ class Robot(event.Dispatcher):
 
     @property
     def pose(self):
-        """:class:`cozmo.util.Pose`: The current pose of cozmo relative to where he started when the engine was initialized.
+        """:class:`cozmo.util.Pose`: The current pose (position and orientation) of Cozmo
         """
         return self._pose
 
@@ -702,6 +740,28 @@ class Robot(event.Dispatcher):
         ''':class:`cozmo.util.Angle`: Cozmo's head angle (up/down).'''
         return self._head_angle
 
+    @property
+    def is_behavior_running(self):
+        '''bool: True if Cozmo is currently running a behavior.
+
+        When Cozmo is running a behavior he will behave fairly autonomously
+        (playing animations and other actions as desired). Attempting to drive
+        Cozmo whilst in this mode will likely have unexpected behavior on
+        the robot and confuse Cozmo.
+        '''
+        return self._is_behavior_running
+
+    @property
+    def is_freeplay_mode_active(self):
+        '''bool: True if Cozmo is in freeplay mode.
+
+        When Cozmo is in freeplay mode he will behave autonomously (playing
+        behaviors, animations and other actions as desired). Attempting to
+        drive Cozmo whilst in this mode will likely have unexpected behavior
+        on the robot and confuse Cozmo.
+        '''
+        return self._is_freeplay_mode_active
+
     #### Private Event Handlers ####
 
     #def _recv_default_handler(self, event, **kw):
@@ -725,17 +785,19 @@ class Robot(event.Dispatcher):
         self._pose_angle = util.radians(msg.poseAngle_rad) # heading in X-Y plane
         self._pose_pitch = util.radians(msg.posePitch_rad)
         self._head_angle = util.radians(msg.headAngle_rad)
-        self.left_wheel_speed  = util.speed_mmps(msg.leftWheelSpeed_mmps)
+        self.left_wheel_speed = util.speed_mmps(msg.leftWheelSpeed_mmps)
         self.right_wheel_speed = util.speed_mmps(msg.rightWheelSpeed_mmps)
-        self.lift_height       = util.distance_mm(msg.liftHeight_mm)
-        self.battery_voltage           = msg.batteryVoltage
-        self.carrying_object_id        = msg.carryingObjectID      # int_32 will be -1 if not carrying object
-        self.carrying_object_on_top_id = msg.carryingObjectOnTopID # int_32 will be -1 if no object on top of object being carried
-        self.head_tracking_object_id   = msg.headTrackingObjectID  # int_32 will be -1 if head is not tracking to any object
-        self.localized_to_object_id    = msg.localizedToObjectID   # int_32 Will be -1 if not localized to any object
+        self.lift_height = util.distance_mm(msg.liftHeight_mm)
+        self.battery_voltage = msg.batteryVoltage
+        self.accelerometer = util.Vector3(msg.accel.x, msg.accel.y, msg.accel.z)
+        self.gyro = util.Vector3(msg.gyro.x, msg.gyro.y, msg.gyro.z)
+        self.carrying_object_id = msg.carryingObjectID  # int_32 will be -1 if not carrying object
+        self.carrying_object_on_top_id = msg.carryingObjectOnTopID  # int_32 will be -1 if no object on top of object being carried
+        self.head_tracking_object_id = msg.headTrackingObjectID  # int_32 will be -1 if head is not tracking to any object
+        self.localized_to_object_id = msg.localizedToObjectID  # int_32 Will be -1 if not localized to any object
         self.last_image_robot_timestamp = msg.lastImageTimeStamp
-        self._robot_status_flags       = msg.status     # uint_16 as bitflags - See _clad_to_game_cozmo.RobotStatusFlag
-        self._game_status_flags        = msg.gameStatus # uint_8  as bitflags - See _clad_to_game_cozmo.GameStatusFlag
+        self._robot_status_flags = msg.status  # uint_16 as bitflags - See _clad_to_game_cozmo.RobotStatusFlag
+        self._game_status_flags = msg.gameStatus  # uint_8  as bitflags - See _clad_to_game_cozmo.GameStatusFlag
 
         if msg.robotID != self.robot_id:
             logger.error("robot ID changed mismatch (msg=%s, self=%s)", msg.robotID, self.robot_id )
@@ -771,6 +833,23 @@ class Robot(event.Dispatcher):
         # RobotActionType.UNKNOWN is a wildcard that matches all actions when cancelling.
         msg = _clad_to_engine_iface.CancelAction(robotID=self.robot_id,
                                                  actionType=_clad_to_engine_cozmo.RobotActionType.UNKNOWN)
+        self.conn.send_msg(msg)
+
+    def enable_facial_expression_estimation(self, enable=True):
+        '''Enable or Disable facial expression estimation
+
+        Cozmo can optionally estimate the facial expression for human faces to
+        see if he thinks they're happy, sad, etc.
+
+        Args:
+            enable (bool): True to enable facial expression estimation, False to
+                disable it. By default Cozmo starts with it disabled to save on
+                processing time.
+        '''
+
+        msg = _clad_to_engine_iface.EnableVisionMode(
+            mode=_clad_to_engine_cozmo.VisionMode.EstimatingFacialExpression,
+            enable=enable)
         self.conn.send_msg(msg)
 
     ### Low-Level Commands ###
@@ -882,6 +961,20 @@ class Robot(event.Dispatcher):
         '''Set the lights on Cozmo's backpack to off.'''
         light_arr = [ lights.off_light ] * 5
         self.set_backpack_lights(*light_arr)
+
+    def set_head_light(self, enable):
+        '''Turn Cozmo's IR headlight on or off.
+
+        The headlight is on the front of Cozmo's chassis, between his two
+        front wheels, underneath his head. Cozmo's camera is IR sensitive
+        so although you cannot see the IR light with the naked eye you will
+        see it in Cozmo's camera feed.
+
+        Args:
+            enable (bool): True turns the light on, False turns it off.
+        '''
+        msg = _clad_to_engine_iface.SetHeadlight(enable=enable)
+        self.conn.send_msg(msg)
 
     def set_head_angle(self, angle, accel=10.0, max_speed=10.0, duration=0.0):
         '''Tell Cozmo's head to turn to a given angle.
@@ -1037,6 +1130,7 @@ class Robot(event.Dispatcher):
         msg = _clad_to_engine_iface.ExecuteBehaviorByExecutableType(
                 behaviorType=behavior_type.id)
         self.conn.send_msg(msg)
+        self._is_behavior_running = True
         return b
 
     async def run_timed_behavior(self, behavior_type, active_time):
@@ -1055,6 +1149,36 @@ class Robot(event.Dispatcher):
         await asyncio.sleep(active_time, loop=self._loop)
         b.stop()
 
+    def start_freeplay_behaviors(self):
+        '''Start running freeplay behaviors on Cozmo
+
+        Puts Cozmo into a freeplay mode where he autonomously drives around
+        and does stuff based on his mood and environment.
+
+        You shouldn't attempt to drive Cozmo during this, as it will clash
+        with whatever the current behavior is attempting to do.
+        '''
+        msg = _clad_to_engine_iface.ActivateBehaviorChooser(
+            _clad_to_engine_cozmo.BehaviorChooserType.Freeplay)
+        self.conn.send_msg(msg)
+
+        self._is_behavior_running = True  # The chooser will run them automatically
+        self._is_freeplay_mode_active = True
+
+    def stop_freeplay_behaviors(self):
+        '''Stop running freeplay behaviors on Cozmo
+
+        Forces Cozmo out of Freeplay mode and stops any currently running
+        behaviors and actions.
+        '''
+
+        msg = _clad_to_engine_iface.ActivateBehaviorChooser(
+            _clad_to_engine_cozmo.BehaviorChooserType.Selection)
+        self.conn.send_msg(msg)
+
+        self._is_freeplay_mode_active = False
+        self._stop_behavior()
+        self.abort_all_actions()
 
     ## Object Commands ##
 
@@ -1198,7 +1322,8 @@ class Robot(event.Dispatcher):
         '''Turn the robot around its current position.
 
         Args:
-            angle: (:class:`cozmo.util.Angle`): The angle to turn.
+            angle: (:class:`cozmo.util.Angle`): The angle to turn. Positive
+                values turn to the left, negative values to the right.
         Returns:
             A :class:`cozmo.robot.TurnInPlace` action object which can be
                 queried to see when it is complete.
@@ -1225,6 +1350,46 @@ class Robot(event.Dispatcher):
                 robot=self, dispatch_parent=self)
         self._action_dispatcher._send_single_action(action)
         return action
+
+    async def backup_onto_charger(self, max_drive_time=3):
+        '''Attempts to reverse robot onto its charger.
+
+        This method assumes the charger is directly behind the robot and
+        will keep driving straight back until charger is in contact, or until
+        a timeout is reached.
+
+        Args:
+            max_drive_time (float): The maximum amount of time in seconds
+                to reverse the robot without detecting the charger.
+        '''
+
+        await self.drive_wheels(-30, -30)
+        timeout = util.Timeout(timeout=max_drive_time)
+        while not (timeout.is_timed_out or self.is_on_charger) :
+            await asyncio.sleep(0.1, loop=self.loop)
+
+        self.stop_all_motors()
+
+    def perform_off_charger(self):
+        '''Returns a context manager to move the robot off of and back onto the charger.
+
+        If the robot is on the charger, it will move a short distance off the contacts,
+        perform the code wrapped by the context and then move the robot back onto the
+        charger after the wrapped code completes.
+
+        Synchronous example::
+
+            with robot.perform_off_charger():
+                action = robot.say_text("Hello")
+                action.wait_for_completed()
+
+        Asynchronous example::
+
+            async with robot.perform_off_charger():
+                action = robot.say_text("Hello")
+                await action.wait_for_completed()
+        '''
+        return self.perform_off_charger_factory(self)
 
     def drive_straight(self, distance, speed, should_play_anim=True):
         '''Tells Cozmo to drive in a straight line
